@@ -1,0 +1,145 @@
+This package is repository for metahunter!
+
+Metahunter is daemon that capture metadata changes and replicate the
+change into a indexing system.
+
+The daemon called metahunter. And there are three dynamically loadable
+module:
+1. Filesystem : FS API to read journal entry and free journal entry
+2. Database :  DB operation to insert the records to database
+3. Processor : defined pipeline to manipulate the process.
+
+Sample is: Filesystem is CEPHFS, DataBase uses Robinhood DB operation.
+Processor is a sample processor deal with two stage pipeline.
+
+autotools/m4/robinhood.m4 is the configuation macro for robinhood,
+configure.ac refers AX_RBH_INFO
+
+The pipeline for meta hunter design.
+
+The metahunter is a daemon to capture the file system metadata updates
+and replicate the metadata which include attribute (ATTR) and extended
+attributes (XATTR) into a indexing system, for example database,
+search engine etc.
+
+The metahunter includes three parts:
+1. journal reader which read the filesystem journal, then encapsulates
+the journal entry into a operation object (op), then push the op into
+a pipeline.
+
+2. pipeline processor. The pipeline have multiple stages. each stage
+has different characters according different op type.
+
+As for a metadata operation can be summarized to:
+
+FS meta op           DB op
+=========           =====
+create         ---> insert
+unlink         ---> delete
+mkdir          ---> insert
+rmdir          ---> delete
+setattr        ---> update
+
+To improve the parallism, each stage of pipeline can be multithreaded.
+NOTE: the operations are ordered...
+
+The principles are:
+different objects MIGHT be able to operated by multiple threads but with
+below constraints.
+
+1. each object operation must be operated in the order of operating.
+2. each object (file/dir) must be operated by only one thread in the same
+stage at any given time.
+3. setattr/create/unlink/rmdir operations arrives the stage, the premise
+of the ops are taken by any thread of the stage is that there is no
+outstanding mkdir operation in the same stage with the parentid of the ops.
+4. rmdir operations arrives the stage, the premise of the op is taken by
+any thread of the stage is that there is no outstanding unlink ops
+associate to the parent dir. (unlink op should mark the parent deleting
+children).
+
+A RB Tree of each stage with the fid key to track the object which are outstanding operating objects. RB Tree key is the fid. value is a structure:
+typedef struct op_object
+{
+    ino_t obj;
+    unsigned int being_processed:1;
+    unsigned int being_created:1;
+    unsigned int being_removed:1;
+
+    unsigned int being_waited;
+    unsigned int deleting_children;
+} op_obj_t;
+
+The RBTree node is allocated when inserted if the object does not exist.
+And the object reference is tracked by op, every op about the object, the reference increase.
+When the op is done, the reference is decreased. Once the reference count decrease to 0, the op_obj_t is destroied.
+
+
+op entry list for each stage:
+
+op1---->op2---->op3---->op4---->op5---->op6---->op7---->op8
+^
+|
+|
+
+cursor
+
+cursor scan the list from the head of the op list and check whether the op would be suspended because it depends on some premise ops. If the op depends on premise op, the premise_op should use a counter "being_waited" to track how many ops depend on the premise_op. When premise op is complete, wakeup the ops that depend on the premise op.
+
+The premise:
+===========
+op_create :
+ + parent is created.
+op_mkdir:
+ + parent is created.
+op_rmdir:
+ + the parent is created
+ + the object is created
+ + no oustanding other ops before rmdir.
+ + children being deleted
+op_unlink:
+ + parent is created
+ + the object is created.
+ + no outstanding other ops before unlink.
+others:
+ + parent is created
+ + the file is created.
+ + no outstanding other ops before unlink.
+
+
+The post condition:
+==================
+op_create:
+ + op following the op about the object can be operated.
+op_mkdir:
+ + op following the op about the dir can be operated.
+ + op following the op about the children of the dir can be operated.
+op_rmdir:
+ + if parent's deleting children == 0, and remove parent can be operated.
+op_unlink:
+ + if parent's deleting children == 0, and remove parent can be operated.
+others:
+ + op following the op about the object can be operated.
+
+
+build rpms:
+=========
+./autogen.sh
+./configure --enable-robinhood --enable-irods --with-robinhood=/ws/robinhood-2.5.5
+cd rpms
+make rpms
+
+Generate below 5 packages:
+
+metahunter-0.0.22-1.0.x86_64.rpm:
+	metahunter framework and daemon CLI for hunter and scanner
+metahunter-ceph-0.0.22-1.0.x86_64.rpm:
+	metahunter filesystem plugin for CEPHFS
+metahunter-debuginfo-0.0.22-1.0.x86_64.rpm
+	metahunter debuginfo
+metahunter-irods-0.0.22-1.0.x86_64.rpm
+	metahunter processor plugin for iRODS
+metahunter-robinhood-0.0.22-1.0.x86_64.rpm
+	metahunter db plugin for robinhood
+
+
